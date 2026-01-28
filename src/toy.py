@@ -81,11 +81,9 @@ def plot_boundary(model, X, y, title, ax):
     ax.set_title(title, fontsize=10)
 
 def main():
-    # 1. Data
     train_loader, guidance_loader, (mean, std) = get_imbalanced_data(device=DEVICE)
     X_test, y_test = get_test_data(mean, std, device=DEVICE)
     
-    # 2. Train Base Models
     clf_base = SimpleClassifier().to(DEVICE)
     print("--- Training Base Classifier ---")
     train_clf(clf_base, train_loader)
@@ -94,31 +92,25 @@ def main():
     scheduler = DDPMScheduler(device=DEVICE)
     train_diff(diff_model, train_loader, scheduler)
     
-    # 3. Compute Influence (Stage 2)
     G_cache = compute_influence_cache(clf_base, guidance_loader, device=DEVICE)
     
-    # 4. Generate Synthetic Data
     n_gen = 1000
     
-    # > Generation Standard (w=0)
+    # Standard Generation (w=0)
     x_std_c0 = tardiff_sample(diff_model, scheduler, clf_base, G_cache, n_samples=n_gen, target_class=0, w=0.0, device=DEVICE)
     x_std_c1 = tardiff_sample(diff_model, scheduler, clf_base, G_cache, n_samples=n_gen, target_class=1, w=0.0, device=DEVICE)
     X_syn_std = torch.FloatTensor(np.vstack([x_std_c0, x_std_c1])).to(DEVICE)
     y_syn = torch.cat([torch.zeros(n_gen), torch.ones(n_gen)]).long().to(DEVICE)
     
-    # > Generation TarDiff (w=100)
+    # TarDiff Generation (w=100)
     x_tar_c0 = tardiff_sample(diff_model, scheduler, clf_base, G_cache, n_samples=n_gen, target_class=0, w=100.0, device=DEVICE)
     x_tar_c1 = tardiff_sample(diff_model, scheduler, clf_base, G_cache, n_samples=n_gen, target_class=1, w=100.0, device=DEVICE)
     X_syn_tar = torch.FloatTensor(np.vstack([x_tar_c0, x_tar_c1])).to(DEVICE)
-    
-    # 5. Evaluation & Plotting
-    
-    # CORRECTION : On ne peut pas faire .dataset.tensors sur un Subset.
+        
     # On reconstruit X_real et y_real en itérant sur le loader d'entraînement.
     X_real_list = []
     y_real_list = []
     
-    # On itère sur le train_loader pour récupérer toutes les données d'entraînement (mélangées)
     for x_batch, y_batch in train_loader:
         X_real_list.append(x_batch)
         y_real_list.append(y_batch)
@@ -128,7 +120,6 @@ def main():
     
     scenarios = {
         'Real Only': (X_real, y_real),
-        # On ajoute les données synthétiques à la fin des données réelles
         'Real + DDPM': (torch.cat([X_real, X_syn_std[n_gen:]]), torch.cat([y_real, y_syn[n_gen:]])),
         'Real + TarDiff': (torch.cat([X_real, X_syn_tar[n_gen:]]), torch.cat([y_real, y_syn[n_gen:]])),
         'Synth Only (DDPM)': (X_syn_std, y_syn),
@@ -140,9 +131,8 @@ def main():
     for name, (tx, ty) in scenarios.items():
         models[name] = eval_pipeline(name, tx, ty, X_test, y_test)
         
-    # Visualization
     fig, axes = plt.subplots(1, 5, figsize=(24, 5))
-    # Passage en numpy pour l'affichage
+
     X_test_np = X_test.cpu().numpy()
     y_test_np = y_test.cpu().numpy()
     

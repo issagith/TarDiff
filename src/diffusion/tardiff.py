@@ -4,7 +4,7 @@ import torch.nn as nn
 def compute_influence_cache(classifier, loader, device='cpu'):
     """Stage 2: Calcule le gradient d'influence moyen (G) sur le dataset de guidance."""
     classifier.eval()
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(reduction="sum")
     
     G_accum = {name: torch.zeros_like(param) for name, param in classifier.named_parameters()}
     total_samples = 0
