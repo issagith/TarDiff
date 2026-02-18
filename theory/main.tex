@@ -1,0 +1,586 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+
+% --- Typography (arXiv-like scientific paper look) ---
+\usepackage{newtxtext}
+\usepackage{newtxmath}
+\usepackage[final]{microtype}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+% --- Math / figures / tables ---
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+% --- Hyperlinks ---
+\usepackage[hidelinks]{hyperref}
+\hypersetup{pdfauthor={},pdftitle={},pdfsubject={},pdfkeywords={}}
+
+\newtheorem{definition}{Définition}
+\newtheorem{assumption}{Hypothèse}
+\newtheorem{lemma}{Lemme}
+\newtheorem{theorem}{Théorème}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollaire}
+\newtheorem{remark}{Remarque}
+
+\title{TarDiff : génération guidée par influence pour améliorer une tâche downstream (rendu théorique)}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Contexte et objectifs du projet}
+Ce document constitue mon rendu pour le cours \emph{Simulation et modèles génératifs}. Il s'agit d'une synthèse \textbf{théorique} de l'article \emph{TarDiff: Target-Oriented EHR Generation for Improving Downstream Tasks} (\cite{tardiff}), dont l'objectif est de relier de façon rigoureuse un \emph{mécanisme de guidage} (au niveau du sampling d'un modèle de diffusion) à une \emph{amélioration mesurable} d'une tâche d'apprentissage supervisé.
+
+Le contexte applicatif est celui des dossiers médicaux électroniques (EHR, \emph{Electronic Health Records}). Dans ce domaine, les données réelles sont souvent limitées (taille d'échantillon, déséquilibres, hétérogénéité), et la contrainte de confidentialité rend la génération de données synthétiques particulièrement attractive.
+
+Cependant, une difficulté conceptuelle demeure : un modèle génératif peut produire des échantillons plausibles au sens statistique, sans pour autant être \emph{utile} pour une tâche downstream. En effet, optimiser une vraisemblance ou un critère de qualité ``perceptive'' n'est pas équivalent à optimiser un risque de classification/régression ; ajouter des points redondants peut même accroître la variance de l'estimateur downstream. La question que pose TarDiff est donc la suivante : \emph{peut-on orienter la génération afin que les échantillons synthétiques soient, par construction, alignés avec une amélioration de performance downstream ?}
+
+L'idée centrale de l'article est d'utiliser une approximation d'\emph{influence} au sens suivant : un point synthétique est jugé \emph{utile} s'il induit une \textbf{baisse attendue de la loss} de la tâche downstream (sur une distribution de test, ou un proxy empirique). En notant $R_T$ le risque de la tâche $T$ (idéalement en population) et $\phi^*$ les paramètres appris sur les données réelles, l'utilité théorique d'un candidat $\hat z$ s'écrit
+\[
+\Delta_T(\hat z) := R_T(\phi^*)-R_T(\phi^{\hat z}),
+\]
+où $\phi^{\hat z}$ désigne les paramètres après \emph{ré-entrainement} en ajoutant $\hat z$ (opération prohibitive si on la répète pour beaucoup de candidats).
+TarDiff propose alors un \emph{proxy calculable} : on remplace $R_T$ par un \emph{guide set} $\mathcal D_{\text{guide}}$ (qui sert de proxy de test) et l'on approxime $\Delta_T(\hat z)$ par un score exprimable à partir de gradients d'un modèle downstream entraîné sur les données réelles. Cette information est amortie sous forme de \emph{gradient cache} au cours du sampling.
+
+La lecture est organisée comme suit : la Section~\ref{sec:method} décrit la méthode TarDiff et explicite ce que l'article présente comme ses apports ; la Section~\ref{sec:theory} propose un cadre mathématique, une expansion du gain et des bornes permettant de comprendre quand le guidage est informatif ; enfin, la conclusion discute les hypothèses, les limites et des pistes d'extension.
+
+\section{Méthode TarDiff (vue d'ensemble)}
+\label{sec:method}
+On note $\mathcal D_{\text{train}}$ le jeu d'entraînement réel, $\mathcal D_{\text{guide}}$ un jeu (réel) utilisé pour \emph{définir} ce que signifie ``améliorer'' la tâche downstream, et $q_\theta$ un modèle de diffusion génératif conditionnel (par exemple conditionné par un label ou un sous-groupe clinique).
+
+La méthode peut se lire comme l'assemblage de deux briques : (i) un modèle downstream $f_\phi$ qui définit la tâche et fournit un signal de gradient, (ii) un mécanisme de guidage qui injecte ce signal dans le sampling du modèle de diffusion.
+
+\paragraph{1) Influence : mesurer l'utilité d'un point synthétique pour une tâche.}
+On fixe une tâche downstream $T$ et un modèle $f_\phi$ avec une loss par point $\ell_T(x,y;\phi)$.
+Sur le train réel
+$\mathcal D_{\text{train}}=\{(x_i,y_i)\}_{i=1}^n$,
+le modèle downstream est entraîné et fournit des paramètres figés
+\[
+\phi^*:=\arg\min_{\phi}\sum_{(x_i,y_i)\in\mathcal D_{\text{train}}}\ell_T(x_i,y_i;\phi).
+\]
+
+On considère un candidat synthétique $\hat z=(x,y)$ que l'on ajouterait au train ; l'optimum associé devient
+\[
+\phi^{\hat z}:=\arg\min_{\phi}\sum_{(x_i,y_i)\in\mathcal D_{\text{train}}\cup\{\hat z\}}\ell_T(x_i,y_i;\phi).
+\]
+Pour un futur point i.i.d. $(x',y')\sim P$ (distribution des données ``non vues''), on définit le changement de loss induit par l'ajout de $\hat z$ :
+\[
+H(\hat z; x',y'):=\ell_T(x',y';\phi^{\hat z})-\ell_T(x',y';\phi^*).
+\]
+L'\emph{influence} (au sens ``utilité en généralisation'') est alors la baisse attendue de loss :
+\[
+\Delta L_T(\hat z)
+\;\triangleq\;
+-\mathbb E_{(x',y')\sim P}\big[\ell_T(x',y';\phi^{\hat z})-\ell_T(x',y';\phi^*)\big]
+= -\mathbb E_{(x',y')\sim P}\big[H(\hat z; x',y')\big].
+\]
+\emph{Objectif conceptuel :} générer des points qui maximisent $\Delta L_T(\hat z)$.
+
+\paragraph{2) Approximation pratique : guide set et cache de gradients.}
+En pratique, $P$ est inconnu et $\phi^{\hat z}$ est intractable à recalculer pour chaque candidat.
+Le papier remplace donc l'espérance population par un \emph{guidance set}
+$\mathcal D_{\text{guide}}=\{(x_g,y_g)\}_{g=1}^m$ (supposé i.i.d. de $P$), et approxime l'influence via une heuristique de type \emph{influence function} : l'effet d'ajouter $\hat z$ est capturé (au signe et à des constantes près) par l'alignement entre (i) le gradient de loss du candidat et (ii) une direction d'amélioration agrégée sur le guide set.
+
+On pré-calcule le \emph{gradient cache}
+\[
+G\;\triangleq\;\nabla R_{\text{guide}}(\phi^*)
+=\frac{1}{m}\sum_{g=1}^m\nabla_\phi\ell_T(x_g,y_g;\phi^*),
+\qquad
+R_{\text{guide}}(\phi):=\frac{1}{m}\sum_{g=1}^m\ell_T(x_g,y_g;\phi).
+\]
+Pour un candidat $\hat z=(x,y)$, on évalue ensuite
+\[
+S(\hat z)\;:=\;-\langle G,\nabla_\phi\ell_T(x,y;\phi^*)\rangle,
+\qquad
+S_{\text{norm}}(\hat z):=-\frac{\langle G,\nabla_\phi\ell_T(x,y;\phi^*)\rangle}{\|\nabla_\phi\ell_T(x,y;\phi^*)\|^2+\tau}.
+\]
+Ces scores ne sont pas l'objectif final, mais un \emph{proxy calculable} de la baisse attendue de loss (sur $\mathcal D_{\text{guide}}$) que produirait l'ajout de $\hat z$.
+
+\paragraph{3) Guidage de la diffusion : version ``classifier guidance'' orientée tâche.}
+On considère un modèle de diffusion conditionnel par $y$.
+Au temps $t$, le reverse process standard s'écrit
+\[
+ p_\theta(x_{t-1}\mid x_t,y)=\mathcal N\big(\mu_\theta(x_t,y,t),\Sigma_\theta(t)\big).
+\]
+TarDiff reprend la logique du \emph{classifier guidance} : au lieu d'ajouter un gradient $\nabla_{x_t}\log p(y\mid x_t)$, on ajoute un gradient orienté tâche.
+En lisant $x_t$ comme un \emph{prototype} d'échantillon final, on définit le signal
+\[
+J_t(x_t,y)
+\;\triangleq\;
+\nabla_{x_t}\Big(\langle G,\nabla_\phi\ell_T(x_t,y;\phi^*)\rangle\Big)
+\quad \text{(ou la variante normalisée).}
+\]
+Puis on modifie la moyenne
+\[
+\widetilde\mu_t=\mu_\theta(x_t,y,t)+w\,J_t(x_t,y),
+\qquad
+x_{t-1}\sim\mathcal N\big(\widetilde\mu_t,\Sigma_\theta(t)\big).
+\]
+La trajectoire de débruitage est ainsi biaisée vers des régions de l'espace des données où les candidats ont une influence (approchée) élevée, donc sont susceptibles d'améliorer la tâche downstream.
+
+\paragraph{4) Sélection et ajout de données.}
+En pratique, on génère plusieurs candidats (par exemple $K$ trajectoires) et l'on sélectionne un ``best-of-$K$'' selon $S$ ou $S_{\text{norm}}$, puis on ajoute ces points à l'entraînement downstream.
+
+
+
+\section{Partie théorique : formalisme et garanties}
+\label{sec:theory}
+L'objectif théorique est de rendre explicite le lien entre (i) un point synthétique $\hat z$ et (ii) la \textbf{baisse attendue de la loss} sur la tâche downstream.
+Le papier formule cette utilité en termes d'\emph{influence} : l'ajout d'un point est bénéfique s'il diminue un risque de test (ou population) de la tâche.
+Comme ce risque est inaccessible, on raisonne avec un proxy empirique, le guide set, qui sert de \emph{surrogate} de test.
+
+Le fil directeur est le suivant : (a) contrôler la stabilité du minimiseur downstream après perturbation, (b) effectuer une expansion au premier ordre du risque (ici $R_{\text{guide}}$), (c) obtenir un score calculable et interprétable qui approxime l'influence, et (d) quantifier l'erreur liée au fait que $G$ est estimé sur un guide set fini.
+
+\subsection{Cadre formel}
+
+\paragraph{Données et modèle downstream.}
+Soit $Z=(X,Y)\sim P$ une variable aléatoire sur $\mathcal X\times\mathcal Y$.
+On considère un modèle downstream paramétré $f_\phi:\mathcal X\to\mathbb R$ avec $\phi\in\mathbb R^p$ et une perte
+$\ell:\mathbb R\times\mathcal Y\to\mathbb R$.
+On note, pour $z=(x,y)$,
+\[
+\ell_z(\phi) := \ell(f_\phi(x),y).
+\]
+
+\paragraph{ERM régularisé.}
+Soit $\mathcal D_{\text{train}}=\{z_1,\dots,z_n\}$ et $\mathcal D_{\text{guide}}=\{z'_1,\dots,z'_m\}$, deux échantillons i.i.d. de $P$ (typiquement disjoints).
+On définit l'objectif d'entrainement downstream
+\[
+F(\phi) := \frac1n\sum_{i=1}^n \ell_{z_i}(\phi) + \frac{\lambda}{2}\|\phi\|^2,
+\qquad
+\phi^* := \arg\min_{\phi\in\mathbb R^p} F(\phi).
+\]
+On définit également le \emph{guide risk}
+\[
+R_{\text{guide}}(\phi):=\frac1m\sum_{j=1}^m \ell_{z'_j}(\phi),
+\qquad
+G := \nabla R_{\text{guide}}(\phi^*)= \frac1m\sum_{j=1}^m \nabla \ell_{z'_j}(\phi^*).
+\]
+Dans l'algorithme TarDiff simplifié, $G$ est pré-calculé (gradient cache) et réutilisé lors du sampling guidé.
+
+\paragraph{Ajout d'un point synthétique.}
+Soit $\hat z=(\hat x,\hat y)$ un point (synthétique) candidat. Pour $\epsilon>0$, on définit l'objectif perturbé
+\[
+F_{\hat z}(\phi) := F(\phi) + \epsilon\,\ell_{\hat z}(\phi),
+\qquad
+\phi^{\hat z} := \arg\min_{\phi\in\mathbb R^p} F_{\hat z}(\phi).
+\]
+L'amélioration downstream désirée est une baisse de $R_{\text{guide}}(\phi)$ quand on passe de $\phi^*$ a $\phi^{\hat z}$.
+
+\subsection{Hypothèses}
+
+Les hypothèses ci-dessous ne sont pas celles d'un modèle de diffusion (qui est non convexe et haut-dimensionnel), mais celles d'une analyse locale du \emph{problème downstream}. Elles servent à isoler le mécanisme d'influence : on suppose que, près de $\phi^*$, le paysage est suffisamment régulier pour que les expansions au premier ordre aient un reste contrôlé.
+
+\begin{assumption}[Régularité et bornes]
+\label{ass:reg}
+Il existe des constantes $L_F,L_g,B>0$ telles que $F$ soit $L_F$-lisse, $R_{\text{guide}}$ soit $L_g$-lisse, et que les gradients par point soient bornés dans la région pertinente : pour tout $z$, $\|\nabla \ell_z(\phi^*)\|\le B$.
+\end{assumption}
+
+\begin{assumption}[Forte convexité via régularisation]
+\label{ass:sc}
+On suppose $\lambda>0$. Alors $F$ est $\lambda$-fortement convexe et $\nabla^2F(\phi)\succeq \lambda I$ pour tout $\phi$.
+\end{assumption}
+
+\begin{remark}
+L'Hypothèse \ref{ass:sc} est immédiatement vraie pour la ridge regression.
+Pour la régression logistique, elle est garantie dès que l'on ajoute une régularisation quadratique $\frac{\lambda}{2}\|\phi\|^2$.
+\end{remark}
+
+\subsection{Stabilité du minimiseur après ajout d'un point (résultat de stabilité)}
+
+Le premier ingrédient est une borne non asymptotique sur le déplacement $\phi^{\hat z}-\phi^*$.
+
+\begin{proposition}[Borne de stabilité]
+\label{prop:stab}
+Sous les Hypothèses \ref{ass:reg} et \ref{ass:sc}, pour tout $\hat z$,
+\[
+\|\phi^{\hat z}-\phi^*\|
+\le \frac{\epsilon}{\lambda}\,\|\nabla \ell_{\hat z}(\phi^*)\|
+\le \frac{\epsilon B}{\lambda}.
+\]
+\end{proposition}
+
+\begin{proof}
+Par optimalité, $\nabla F(\phi^*)=0$ et $\nabla F_{\hat z}(\phi^{\hat z})=0$, donc
+\[
+\nabla F(\phi^{\hat z}) - \nabla F(\phi^*) = -\epsilon \nabla \ell_{\hat z}(\phi^{\hat z}).
+\]
+Par $\lambda$-forte convexité de $F$, l'opérateur $\nabla F$ est $\lambda$-fortement monotone, ce qui implique
+$\|\nabla F(\phi^{\hat z})-\nabla F(\phi^*)\|\ge \lambda\|\phi^{\hat z}-\phi^*\|$.
+Donc
+\[
+\lambda\|\phi^{\hat z}-\phi^*\|\le \epsilon\|\nabla \ell_{\hat z}(\phi^{\hat z})\|.
+\]
+En utilisant une borne locale $\|\nabla \ell_{\hat z}(\phi^{\hat z})\|\le B$ (ou simplement $\|\nabla \ell_{\hat z}(\phi^*)\|\le B$ et continuité), on conclut.
+\end{proof}
+
+\noindent\textbf{Lien Section 3.}
+Dans le cas ridge, la mise a jour de $\phi$ après ajout d'un point est explicite (Sherman-Morrison), ce qui permet de vérifier cette borne numériquement et analytiquement.
+
+\subsection{Approximation du gain sur l'ensemble de guidage}
+
+On quantifie maintenant l'effet de l'ajout de $\hat z$ sur $R_{\text{guide}}$.
+
+\begin{theorem}[Expansion du gain avec reste contrôlé]
+\label{thm:gain}
+Sous les Hypothèses \ref{ass:reg} et \ref{ass:sc}, pour tout $\hat z$,
+\[
+R_{\text{guide}}(\phi^{\hat z}) - R_{\text{guide}}(\phi^*)
+=
+\langle G,\phi^{\hat z}-\phi^*\rangle + \Delta_{\text{rem}}(\hat z),
+\qquad
+|\Delta_{\text{rem}}(\hat z)| \le \frac{L_g}{2}\|\phi^{\hat z}-\phi^*\|^2.
+\]
+En particulier, avec la Proposition \ref{prop:stab},
+\[
+|\Delta_{\text{rem}}(\hat z)| \le \frac{L_g}{2}\left(\frac{\epsilon B}{\lambda}\right)^2.
+\]
+\end{theorem}
+
+\begin{proof}
+Par $L_g$-lissité de $R_{\text{guide}}$, le théorème de Taylor avec reste donne
+\[
+R_{\text{guide}}(\phi^{\hat z}) = R_{\text{guide}}(\phi^*) + \langle \nabla R_{\text{guide}}(\phi^*), \phi^{\hat z}-\phi^*\rangle + \Delta_{\text{rem}},
+\]
+avec $|\Delta_{\text{rem}}|\le \frac{L_g}{2}\|\phi^{\hat z}-\phi^*\|^2$.
+Comme $\nabla R_{\text{guide}}(\phi^*)=G$, on obtient l'égalité.
+\end{proof}
+
+\begin{remark}[Lecture]
+Le terme principal $\langle G,\phi^{\hat z}-\phi^*\rangle$ contrôle l'amélioration sur le guide set, tandis que l'erreur est de taille quadratique en $\|\phi^{\hat z}-\phi^*\|$.
+Cela justifie le fait que le steering doit rester dans un régime de perturbation modérée.
+\end{remark}
+
+\noindent\textbf{Lien Section 3.}
+Sur le toy logistique 2D, on illustrera que le terme principal prédit bien l'amélioration et que l'erreur augmente quand le steering devient trop agressif.
+
+\subsection{Score calculable utilisé par TarDiff : mise à jour normalisée type Charpiat}
+
+La section précédente ramène le problème à relier l'ajout de $\hat z$ à une baisse de $R_{\text{guide}}$.
+Dans TarDiff, on évite délibérément les formules d'influence impliquant une inversion de Hessien (type Koh--Liang), difficiles à estimer et coûteuses à appliquer dans des modèles downstream modernes.
+À la place, le papier adopte une approximation plus simple et stable numériquement (inspirée de \cite{charpiat}) : définir une \emph{petite mise à jour normalisée} de paramètres à partir du gradient d'un point candidat, puis évaluer l'effet de cette mise à jour sur le guide set au premier ordre.
+
+\paragraph{Mise à jour normalisée.}
+\begin{definition}[Mise à jour normalisée]
+\label{def:charpiat}
+On définit
+\[
+\delta\phi_{\text{norm}}(\hat z):= -\varepsilon \frac{\nabla \ell_{\hat z}(\phi^*)}{\|\nabla \ell_{\hat z}(\phi^*)\|^2+\tau},
+\]
+où $\varepsilon>0$ contrôle l'amplitude et $\tau>0$ stabilise les cas où $\|\nabla \ell_{\hat z}(\phi^*)\|$ est très faible.
+\end{definition}
+
+\paragraph{Lien direct avec la baisse sur le guide set.}
+\begin{proposition}[Baisse du guide risk sous mise à jour normalisée]
+\label{prop:charpiat_gain}
+Sous l'Hypothèse \ref{ass:reg}, on a
+\[
+R_{\text{guide}}(\phi^*+\delta\phi_{\text{norm}}(\hat z)) - R_{\text{guide}}(\phi^*)
+\le
+-\varepsilon\,\frac{\langle G,\nabla \ell_{\hat z}(\phi^*)\rangle}{\|\nabla \ell_{\hat z}(\phi^*)\|^2+\tau}
++
+\frac{L_g}{2}\|\delta\phi_{\text{norm}}(\hat z)\|^2.
+\]
+\end{proposition}
+
+\begin{proof}
+Appliquer Taylor à $R_{\text{guide}}$ entre $\phi^*$ et $\phi^*+\delta\phi_{\text{norm}}(\hat z)$ :
+\[
+R_{\text{guide}}(\phi^*+\delta)-R_{\text{guide}}(\phi^*) \le \langle G,\delta\rangle + \frac{L_g}{2}\|\delta\|^2,
+\]
+puis remplacer $\delta$ par $\delta\phi_{\text{norm}}(\hat z)$ et simplifier.
+\end{proof}
+
+\begin{remark}[Interprétation TarDiff]
+Le terme principal de la Proposition \ref{prop:charpiat_gain} est exactement le score de guidage/sélection (au signe près) :
+\[
+S_{\text{norm}}(\hat z) := -\frac{\langle G,\nabla \ell_{\hat z}(\phi^*)\rangle}{\|\nabla \ell_{\hat z}(\phi^*)\|^2+\tau}.
+\]
+Cette forme (i) ne dépend d'aucune matrice de courbure, (ii) rend le score plus robuste quand la norme des gradients varie fortement d'un candidat à l'autre.
+\end{remark}
+
+\noindent\textbf{Lien Section 3.}
+Dans la suite, les dérivations et garanties seront exprimées en termes de $S_{\text{norm}}$ (ou $S$) sans recours à une inversion de Hessien.
+
+\subsection{Généralisation : concentration de $G$ et sélection parmi $K$ candidats}
+
+Le vecteur $G$ est une estimation empirique de
+\[
+G_{\text{pop}} := \nabla R(\phi^*) \quad \text{où} \quad R(\phi):=\mathbb E[\ell_Z(\phi)].
+\]
+
+\begin{definition}[Complexité de Rademacher (classe associée aux gradients)]
+\label{def:rad_grad}
+On considère la classe de fonctions réelles
+\[
+\mathcal F := \big\{ f_u:z\mapsto \langle u,\nabla \ell_z(\phi^*)\rangle : u\in\mathbb R^p,\ \|u\|\le 1\big\}.
+\]
+Sa complexité de Rademacher empirique sur $\mathcal D_{\text{guide}}=\{z'_1,\dots,z'_m\}$ est
+\[
+\widehat{\mathfrak R}_m(\mathcal F)
+:=
+\mathbb E_{\sigma}\Big[\sup_{f\in\mathcal F}\frac1m\sum_{j=1}^m \sigma_j f(z'_j)\,\Big|\,\mathcal D_{\text{guide}}\Big],
+\]
+avec $\sigma_1,\dots,\sigma_m$ i.i.d. uniformes sur $\{\pm1\}$.
+\end{definition}
+
+\begin{theorem}[Concentration de $G$ via complexité de Rademacher]
+\label{thm:conc}
+Supposons $\|\nabla \ell_Z(\phi^*)\|\le B$ presque surement.
+Alors, pour tout $\delta\in(0,1)$, avec probabilité au moins $1-\delta$ (sur l'échantillonnage de $\mathcal D_{\text{guide}}$),
+\[
+\|G-G_{\text{pop}}\|
+=
+\sup_{\|u\|\le 1}\Big|\frac1m\sum_{j=1}^m \langle u,\nabla \ell_{z'_j}(\phi^*)\rangle - \mathbb E\,\langle u,\nabla \ell_Z(\phi^*)\rangle\Big|
+\le
+2\widehat{\mathfrak R}_m(\mathcal F)
++
+B\sqrt{\frac{2\log(2/\delta)}{m}}.
+\]
+\end{theorem}
+
+\begin{proof}
+On suit la preuve standard via symétrisation puis concentration (voir le chapitre sur la complexité de Rademacher dans le poly \cite{biau_poly}).
+
+\paragraph{Étape 1 : réécriture comme borne uniforme.}
+Pour $u\in\mathbb R^p$ avec $\|u\|\le 1$, poser $f_u(z)=\langle u,\nabla \ell_z(\phi^*)\rangle$.
+Alors
+\[
+\|G-G_{\text{pop}}\|
+=
+\sup_{\|u\|\le 1}\Big|\frac1m\sum_{j=1}^m f_u(z'_j)-\mathbb E f_u(Z)\Big|
+=
+\sup_{f\in\mathcal F}\Big|\widehat{\mathbb E}_m f-\mathbb E f\Big|,
+\]
+avec $\widehat{\mathbb E}_m f:=\frac1m\sum_{j=1}^m f(z'_j)$.
+Sous l'hypothèse $\|\nabla \ell_Z(\phi^*)\|\le B$, on a $|f(Z)|\le B$ p.s. pour tout $f\in\mathcal F$.
+
+\paragraph{Étape 2 : symétrisation (contrôle de l'espérance).}
+Définir
+\[
+\Phi(\mathcal D_{\text{guide}}):=\sup_{f\in\mathcal F}\big(\mathbb E f-\widehat{\mathbb E}_m f\big).
+\]
+Soit $\mathcal D'_{\text{guide}}$ un \emph{ghost sample} i.i.d. indépendant de même loi, et noter
+$\widehat{\mathbb E}'_m f:=\frac1m\sum_{j=1}^m f(z''_j)$.
+Par Jensen puis linéarité,
+\[
+\mathbb E\,\Phi(\mathcal D_{\text{guide}})
+\le
+\mathbb E\Big[\sup_{f\in\mathcal F}\big(\widehat{\mathbb E}'_m f-\widehat{\mathbb E}_m f\big)\Big].
+\]
+Introduire des variables de Rademacher $\sigma_1,\dots,\sigma_m$ i.i.d. dans $\{\pm1\}$, indépendantes de tout le reste.
+Par symétrisation (voir \cite{biau_poly}),
+\[
+\mathbb E\Big[\sup_{f\in\mathcal F}\big(\widehat{\mathbb E}'_m f-\widehat{\mathbb E}_m f\big)\Big]
+\le
+2\,\mathbb E\big[\widehat{\mathfrak R}_m(\mathcal F)\big].
+\]
+En particulier, conditionnellement à $\mathcal D_{\text{guide}}$, on obtient
+$\mathbb E\,\Phi(\mathcal D_{\text{guide}})\le 2\,\mathbb E\,\widehat{\mathfrak R}_m(\mathcal F)$.
+
+\paragraph{Étape 3 : concentration (McDiarmid).}
+La fonction $\Phi(\mathcal D_{\text{guide}})$ vérifie une propriété de différences bornées :
+si l'on remplace un seul point $z'_j$ par un autre $\tilde z'_j$, alors pour tout $f\in\mathcal F$,
+$|\widehat{\mathbb E}_m f-\widehat{\mathbb E}_m^{(j)} f|\le \frac{2B}{m}$, donc
+$|\Phi(\mathcal D_{\text{guide}})-\Phi(\mathcal D_{\text{guide}}^{(j)})|\le \frac{2B}{m}$.
+Par l'inégalité de McDiarmid (voir \cite{biau_poly}), avec probabilité au moins $1-\delta/2$,
+\[
+\Phi(\mathcal D_{\text{guide}})
+\le
+\mathbb E\,\Phi(\mathcal D_{\text{guide}})
++
+B\sqrt{\frac{2\log(2/\delta)}{m}}.
+\]
+En appliquant le même argument à $\sup_{f\in\mathcal F}(\widehat{\mathbb E}_m f-\mathbb E f)$ et en combinant par union bound,
+on obtient avec probabilité au moins $1-\delta$ :
+\[
+\sup_{f\in\mathcal F}\Big|\widehat{\mathbb E}_m f-\mathbb E f\Big|
+\le
+2\widehat{\mathfrak R}_m(\mathcal F)
++
+B\sqrt{\frac{2\log(2/\delta)}{m}}.
+\]
+Enfin, en identifiant le membre de gauche avec $\|G-G_{\text{pop}}\|$, on conclut.
+\end{proof}
+
+\begin{proposition}[Contrôle uniforme sur $K$ candidats et garantie best-of-$K$]
+\label{prop:bestK}
+Supposons $\|\nabla \ell_{\hat z_k}(\phi^*)\|\le B$ pour $k=1,\dots,K$.
+Définissons les scores population et empirique :
+\[
+s_{\text{pop}}(\hat z):=\langle G_{\text{pop}},\nabla \ell_{\hat z}(\phi^*)\rangle,
+\qquad
+s(\hat z):=\langle G,\nabla \ell_{\hat z}(\phi^*)\rangle.
+\]
+Alors, avec probabilité au moins $1-\delta$,
+\[
+\max_{k\le K}\,|s(\hat z_k)-s_{\text{pop}}(\hat z_k)|
+\le
+B\Big(2\widehat{\mathfrak R}_m(\mathcal F)+B\sqrt{\frac{2\log(2K/\delta)}{m}}\Big).
+\]
+En particulier, si $\hat z_{\text{sel}}=\arg\max_{k\le K} s(\hat z_k)$, alors
+\[
+s_{\text{pop}}(\hat z_{\text{sel}})
+\ge
+\max_{k\le K} s_{\text{pop}}(\hat z_k)
+-
+2B\Big(2\widehat{\mathfrak R}_m(\mathcal F)+B\sqrt{\frac{2\log(2K/\delta)}{m}}\Big).
+\]
+\end{proposition}
+
+\begin{proof}
+Par Cauchy--Schwarz,
+$|s(\hat z)-s_{\text{pop}}(\hat z)| \le \|G-G_{\text{pop}}\|\,\|\nabla \ell_{\hat z}(\phi^*)\| \le B\|G-G_{\text{pop}}\|$.
+En appliquant le Théorème \ref{thm:conc} avec une union bound sur $K$ candidats (remplacer $\delta$ par $\delta/K$), on obtient avec probabilité au moins $1-\delta$ :
+\[
+\max_{k\le K}\,|s(\hat z_k)-s_{\text{pop}}(\hat z_k)|
+\le
+B\Big(2\widehat{\mathfrak R}_m(\mathcal F)+B\sqrt{\frac{2\log(2K/\delta)}{m}}\Big).
+\]
+Pour la garantie best-of-$K$, on reprend l'inégalité triangulaire standard : si l'on note
+$\varepsilon_K:=B\big(2\widehat{\mathfrak R}_m(\mathcal F)+B\sqrt{\tfrac{2\log(2K/\delta)}{m}}\big)$, alors
+\[
+s_{\text{pop}}(\hat z_{\text{sel}})
+\ge s(\hat z_{\text{sel}})-\varepsilon_K
+\ge \max_k s(\hat z_k)-\varepsilon_K
+\ge \max_k s_{\text{pop}}(\hat z_k)-2\varepsilon_K.
+\]
+\end{proof}
+
+\noindent\textbf{Lien Section 3.}
+On pourra implémenter une ablation "best-of-$K$" : générer $K$ candidats, sélectionner celui qui maximise $S$ ou $S_{\text{norm}}$, puis mesurer l'effet sur la performance downstream.
+
+\subsection{Conséquences pour le steering dans la diffusion : rôle du poids $w$}
+
+\paragraph{Mise a jour guidée (forme discrète).}
+Dans une implémentation DDPM, une étape de sampling (guidée) peut se schématiser par
+\[
+x_{t-1} = \mu_\theta(x_t,t,y) + \sigma_t\xi_t + w\,J(x_t,t,y),
+\]
+où $\xi_t\sim\mathcal N(0,I)$ et
+\[
+J(x_t,t,y) := \nabla_{x_t}\Big(\langle G, \nabla_\phi \ell(f_{\phi^*}(x_t),y)\rangle\Big)
+\]
+(ou la variante normalisée en remplaçant $\langle G,\nabla_\phi\ell\rangle$ par $S_{\text{norm}}$).
+
+\begin{assumption}[Lipschitz local du champ de guidage]
+\label{ass:LJ}
+Pour chaque $t$, il existe $L_J(t)>0$ tel que, dans la région effectivement explorée par le sampler,
+\[
+\|J(x,t,y)-J(x',t,y)\| \le L_J(t)\|x-x'\|.
+\]
+\end{assumption}
+
+\begin{remark}[Condition suffisante de stabilité locale]
+Si $w\,L_J(t)$ est trop grand, le terme de guidage peut dominer $\mu_\theta$ et provoquer des sauts importants entre itérations. La lecture est alors similaire à celle d'un schéma numérique explicite : un drift trop agressif rend la trajectoire instable.
+
+Concrètement, cela justifie trois choix pratiques courants : (i) régler $w$ par validation, (ii) normaliser ou \emph{clipper} $J$ pour éviter des gradients extrêmes, et (iii) augmenter le nombre de pas de sampling (pas effectifs plus petits). Ces effets sont cohérents avec l'observation empirique : lorsque $w$ devient trop grand, la qualité et la diversité des échantillons se dégradent, et l'aval (downstream) peut chuter malgré un guidage plus fort.
+\end{remark}
+
+\noindent\textbf{Lien Section 3.}
+On illustrera la sensibilité a $w$ via des courbes (perf downstream vs $w$), et on comparera la stabilité numérique entre score normalisé et non normalisé.
+
+\subsection{Résumé opérationnel}
+
+En résumé, l'analyse met en évidence un régime où le guidage par influence est conceptuellement justifié. D'une part, la Proposition~\ref{prop:stab} montre que l'ajout d'un point (pondéré par $\epsilon$) ne déplace pas trop le minimiseur downstream dès lors que la régularisation induit une forte convexité effective : c'est précisément ce qui permet de raisonner localement autour de $\phi^*$. D'autre part, le Théorème~\ref{thm:gain} identifie le terme déterminant pour le gain sur le guide set : au premier ordre,
+\[
+R_{\text{guide}}(\phi^{\hat z})-R_{\text{guide}}(\phi^*) \approx \langle G,\phi^{\hat z}-\phi^*\rangle.
+\]
+
+Le problème se réduit alors à construire un proxy calculable de l'amélioration de $R_{\text{guide}}$ induite par l'ajout de $\hat z$. La mise à jour normalisée (Définition~\ref{def:charpiat} et Proposition~\ref{prop:charpiat_gain}) donne précisément un score stable numériquement, proche de celui employé par TarDiff.
+Enfin, le Théorème~\ref{thm:conc} et la Proposition~\ref{prop:bestK} clarifient la dimension statistique du procédé : la taille du guide set contrôle l'erreur sur $G$, et une sélection best-of-$K$ amplifie le gain attendu tout en rendant la dépendance à l'estimation de $G$ plus critique.
+
+\subsection{Calculs explicites sur un modèle downstream simple : régression ridge}
+\label{subsec:ridge}
+Cette section instancie le cadre abstrait sur un modèle downstream entièrement explicite : la régression linéaire ridge. L'intérêt est double : (i) le minimiseur et l'influence se calculent en forme fermée, (ii) l'effet d'ajouter un point synthétique peut être analysé via une identité de type Sherman--Morrison.
+
+\paragraph{Modèle et objectifs.}
+On suppose $x\in\mathbb R^d$, $y\in\mathbb R$, $f_\phi(x)=\langle \phi,x\rangle$ et la perte quadratique
+\[
+\ell_{(x,y)}(\phi)=\tfrac12\big(\langle \phi,x\rangle-y\big)^2.
+\]
+Notons $X\in\mathbb R^{n\times d}$ la matrice dont la $i$-ième ligne est $x_i^\top$, et $y\in\mathbb R^n$ le vecteur des labels. Alors
+\[
+F(\phi)=\frac{1}{2n}\|X\phi-y\|^2+\frac{\lambda}{2}\|\phi\|^2,
+\qquad \lambda>0.
+\]
+
+\paragraph{Solution fermée (utile uniquement pour l'intuition).}
+Le minimiseur ridge admet une forme fermée :
+\[
+\phi^*=(\tfrac1n X^\top X+\lambda I)^{-1}\tfrac1n X^\top y.
+\]
+Dans l'esprit TarDiff, l'intérêt de ce cas est surtout d'illustrer la structure du score $S_{\text{norm}}$, sans chercher à exprimer une influence exacte via un Hessien inverse.
+
+\paragraph{Gradient d'un point candidat et score $S_{\text{norm}}$.}
+Pour un candidat $\hat z=(\hat x,\hat y)$, on a
+\[
+\nabla\ell_{\hat z}(\phi)=\big(\langle \phi,\hat x\rangle-\hat y\big)\hat x.
+\]
+En particulier,
+\[
+S(\hat z)=-\langle G,\nabla\ell_{\hat z}(\phi^*)\rangle
+=-\big(\langle \phi^*,\hat x\rangle-\hat y\big)\langle G,\hat x\rangle.
+\]
+La version normalisée devient
+\[
+S_{\text{norm}}(\hat z)
+=-\frac{\big(\langle \phi^*,\hat x\rangle-\hat y\big)\langle G,\hat x\rangle}{\big(\langle \phi^*,\hat x\rangle-\hat y\big)^2\|\hat x\|^2+\tau}.
+\]
+
+\paragraph{Lecture  la TarDiff.}
+Ce score met en évidence trois ingrédients pour qu'un point soit utile :
+\begin{itemize}[leftmargin=*]
+\item \textbf{Résidu non nul.} Si $\hat y\approx\langle \phi^*,\hat x\rangle$, alors $\nabla\ell_{\hat z}(\phi^*)\approx 0$ et le point est localement neutre.
+\item \textbf{Direction alignée avec le guide set.} Le terme $\langle G,\hat x\rangle$ impose que le candidat pointe vers une direction qui réduit la loss du guide set au premier ordre.
+\item \textbf{Normalisation.} Le dénominateur contrôle l'amplitude de la mise à jour et évite qu'un gradient très grand domine uniquement par sa norme.
+\end{itemize}
+
+\paragraph{Lien avec la sélection best-of-$K$.}
+Dans ce cas simple, $\nabla\ell_{\hat z}(\phi^*)$ est proportionnel à $\hat x$, ce qui rend transparent l'effet best-of-$K$ : on sur-échantillonne des directions $\hat x$ qui sont à la fois (i) informatives (résidu non nul) et (ii) alignées avec la direction d'amélioration agrégée via $G$.
+
+\section*{Conclusion : hypothèses, limites et extensions}
+La lecture proposée met en perspective TarDiff comme un couplage entre une idée d'optimisation (raisonner via une perturbation infinitésimale du problème downstream) et une idée de modèles génératifs (biaiser une dynamique de diffusion afin de sur-échantillonner des exemples utiles pour la tâche).
+
+\paragraph{Ce que la théorie justifie.}
+Le message principal est que le guidage peut se comprendre comme une expansion au premier ordre du gain sur un guide set, et qu'un score d'alignement devient informatif lorsque l'on reste dans un régime local contrôlé : perturbations petites, stabilité du minimiseur downstream, et gradients bornés. Dans ce cadre, TarDiff s'apparente à une procédure de sélection adaptative de points, où la diffusion n'est pas seulement un générateur realistic, mais un mécanisme d'exploration orienté par un critère de généralisation.
+
+\paragraph{Où les hypothèses peuvent échouer.}
+Le point fragile, dans un cadre moderne, est la non-convexité du modèle downstream (par exemple un réseau profond) et la complexité géométrique de la distribution des données : l'approximation d'influence devient locale et dépend fortement du point d'optimisation atteint. En parallèle, le guidage dans l'espace $x$ peut induire des trajectoires hors distribution, où les gradients sont instables, ce qui rend le réglage de $w$ et les choix de normalisation déterminants.
+
+\paragraph{Extensions possibles (pistes de travail).}
+Une première direction consiste à remplacer la forte convexité par des hypothèses plus faibles mais adaptées au non-convexe (PL locale, sharpness, ou stabilité algorithmique du schéma d'entraînement).
+Une seconde direction est d'imposer explicitement des contraintes de stabilité du guidage, par exemple via un $w=w(t)$ décroissant et/ou un clipping de $J$, afin de garantir une dynamique de diffusion numériquement stable.
+Enfin, le choix du guide set mérite une analyse dédiée : il définit la notion d'utilité et contrôle la variance de $G$ ; des bornes vectorielles plus fines pourraient éclairer le compromis biais/variance et suggérer des stratégies d'échantillonnage ou de repondération du guide set.
+
+\vspace{8pt}
+\noindent\textbf{Bibliographie minimale.}
+On pourra citer (i) TarDiff, (ii) Charpiat et al. (mise à jour normalisée), ainsi que des références de concentration (Hoeffding vectoriel).
+
+\begin{thebibliography}{9}
+
+\bibitem{tardiff}
+TarDiff: Target-Oriented EHR Generation for Improving Downstream Tasks.
+(Article étudié dans ce projet).
+
+
+
+\bibitem{charpiat}
+G. Charpiat, et al.
+Input Similarity from the Neural Network Perspective.
+\emph{NeurIPS}, 2019.
+
+\bibitem{biau_poly}
+G. Biau.
+\emph{Cours : Apprentissage statistique}.
+Poly de cours (fichier \texttt{coursgerardbiau.pdf}).
+
+\end{thebibliography}
+
+\end{document}
